@@ -1,7 +1,11 @@
+import errno
 import json
 import logging
+import re
 import subprocess
+import threading
 import time
+from pathlib import Path
 from typing import cast
 
 import anyio
@@ -10,7 +14,7 @@ import usb
 import usb.core
 
 from jumpstarter_driver_sdwire import driver as sdwire_driver
-from jumpstarter_driver_sdwire.driver import SDWire
+from jumpstarter_driver_sdwire.driver import SDWire, SDWire3
 
 from jumpstarter.common.utils import serve
 
@@ -150,6 +154,25 @@ def test_find_device_ambiguous_programmed_without_serial(monkeypatch):
     found = sdwire._find_device()
     assert found is not None
     assert found[0] is dev_b
+
+
+def test_repr(monkeypatch):
+    dev = _FakeUSBDev("DP04I34D")
+    dev.get_active_configuration = lambda: None  # ty: ignore[unresolved-attribute]
+
+    def fake_find(idVendor, idProduct, find_all):
+        if (idVendor, idProduct) == (sdwire_driver._PROGRAMMED_VID, sdwire_driver._PROGRAMMED_PID):
+            return iter([dev])
+        return iter([])
+
+    def fake_get_string(dev, idx):
+        return sdwire_driver._PROGRAMMED_PRODUCT if idx == dev.iProduct else dev._serial
+
+    monkeypatch.setattr(sdwire_driver.usb.core, "find", fake_find)
+    monkeypatch.setattr(sdwire_driver.usb.util, "get_string", fake_get_string)
+    monkeypatch.setattr(sdwire_driver.usb.util, "find_descriptor", lambda config, **kwargs: "itf")
+
+    assert repr(SDWire(storage_device="/dev/sdz")).startswith("SDWire(")
 
 
 def test_poll_storage_device_retries(monkeypatch):
@@ -383,6 +406,421 @@ def test_power_cycle_skips_when_no_topology_match(monkeypatch):
     sdwire_driver._power_cycle_smsc_port(cast(usb.core.Device, dev))
     assert hub_a.calls == []
     assert hub_b.calls == []
+
+
+class _FakeSDWire3:
+    """An SDWire3 as pyusb and sysfs see it: interface 0 is bound to usb-storage
+    while the card is on the host. As with libusb on Linux, binding a bound
+    interface fails with EBUSY and unbinding an unbound one with ENOENT, and pyusb
+    keeps the device open after every call but reset(), until it is disposed of.
+
+    Opening the reader wakes it. It runtime-suspends a moment after it is closed
+    and unbound with power/control=auto, and only then is the card on the DUT."""
+
+    root = Path()
+
+    def __init__(self, port_numbers, bus=5, serial="20120501030900000", bound=True):
+        self.bus = bus
+        self.address = 51
+        self.port_numbers = port_numbers
+        self.serial = serial
+        self.bound = bound
+        self.calls = []
+        self.opens = 0
+        self.is_open = False
+        self.held = False
+        self.reset_fails = False
+        self.lock = threading.Lock()
+        if not port_numbers:
+            return
+        self.dir = self.root / f"{bus}-{'.'.join(map(str, port_numbers))}"
+        self.interface = self.dir / f"{self.dir.name}:1.0"
+        (self.dir / "power").mkdir(parents=True)
+        self.interface.mkdir()
+        if serial is not None:
+            self._write("serial", serial)
+        # a reader left unbound was set up to suspend; a bound one has the defaults
+        self._write("power/autosuspend_delay_ms", "2000" if bound else "0")
+        self._write("power/control", "on" if bound else "auto")
+        self._write("power/runtime_status", "active" if bound else "suspended")
+        if bound:
+            (self.interface / "driver").symlink_to(self.root)
+
+    @property
+    def serial_number(self):
+        self._open()
+        return self.serial
+
+    @property
+    def status(self):
+        return self._read("power/runtime_status")
+
+    def is_kernel_driver_active(self, interface):
+        self._open()
+        return self.bound
+
+    def detach_kernel_driver(self, interface):
+        self._open()
+        if not self.bound:
+            raise usb.core.USBError("Entity not found", errno=errno.ENOENT)
+        self.calls.append(("detach", interface))
+        self.power_at_detach = (self._read("power/autosuspend_delay_ms"), self._read("power/control"))
+        self._bind(False)
+
+    def attach_kernel_driver(self, interface):
+        self._open()
+        if self.bound:
+            raise usb.core.USBError("Resource busy", errno=errno.EBUSY)
+        self.calls.append(("attach", interface))
+        self._bind(True)
+
+    def reset(self):
+        self._open()
+        self.calls.append(("reset",))
+        if self.reset_fails:
+            raise usb.core.USBError("Entity not found", errno=errno.ENOENT)
+        self.dispose()
+
+    def dispose(self):
+        self.is_open = False
+        self.settle()
+
+    def hold(self):
+        """Another process opens the reader and keeps it open."""
+        self.held = True
+        self.settle()
+
+    def set_power(self, name, value):
+        """Another process writes a power setting."""
+        self._write(f"power/{name}", value)
+        self.settle()
+
+    def settle(self):
+        """The kernel resumes the reader at once, and suspends it a moment after
+        nothing keeps it awake."""
+        with self.lock:
+            if self._awake():
+                self._write("power/runtime_status", "active")
+                return
+        timer = threading.Timer(0.05, self._suspend)
+        timer.daemon = True
+        timer.start()
+
+    def _open(self):
+        if not self.is_open:
+            self.is_open = True
+            self.opens += 1
+            self.settle()
+
+    def _bind(self, bound):
+        self.bound = bound
+        if bound:
+            (self.interface / "driver").symlink_to(self.root)
+        else:
+            (self.interface / "driver").unlink()
+        self.settle()
+
+    def _read(self, name):
+        try:
+            return (self.dir / name).read_text().strip()
+        except OSError:
+            return None
+
+    def _write(self, name, value):
+        (self.dir / name).write_text(f"{value}\n")
+
+    def _awake(self):
+        return self.is_open or self.bound or self.held or self._read("power/control") != "auto"
+
+    def _suspend(self):
+        with self.lock:
+            if not self._awake():
+                self._write("power/runtime_status", "suspended")
+
+
+ID = "20120501030900000.2"
+
+
+@pytest.fixture(autouse=True)
+def _sysfs(tmp_path, monkeypatch):
+    """The sysfs tree the fake SDWire3s are in."""
+    root = tmp_path / "sys"
+    root.mkdir()
+    monkeypatch.setattr(sdwire_driver, "_SYSFS_USB_DEVICES", str(root))
+    monkeypatch.setattr(_FakeSDWire3, "root", root)
+
+
+def _attach(monkeypatch, *snapshots):
+    """usb.core.find reports one snapshot of the attached 0bda:0316 devices per
+    call; the last snapshot stays. The kernel acts on power settings written to
+    their sysfs directories."""
+    pending = list(snapshots)
+    located = [dev for snapshot in snapshots for dev in snapshot if dev.port_numbers]
+    sysfs_write = sdwire_driver._sysfs_write
+
+    def fake_find(idVendor, idProduct, find_all):
+        if (idVendor, idProduct) != (0x0BDA, 0x0316):
+            return iter([])
+        return iter(pending.pop(0) if len(pending) > 1 else pending[0])
+
+    def write(path, value):
+        sysfs_write(path, value)
+        for dev in located:
+            if Path(path).is_relative_to(dev.dir):
+                dev.settle()
+
+    monkeypatch.setattr(sdwire_driver.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sdwire_driver.usb.core, "find", fake_find)
+    monkeypatch.setattr(sdwire_driver.usb.util, "dispose_resources", lambda dev: dev.dispose())
+    monkeypatch.setattr(sdwire_driver, "_sysfs_write", write)
+
+
+def test_sdwire3_requires_linux(monkeypatch):
+    monkeypatch.setattr(sdwire_driver.platform, "system", lambda: "Darwin")
+    with pytest.raises(RuntimeError, match="requires Linux"):
+        SDWire3(serial="20120501030900000.2-1")
+
+
+def test_sdwire3_requires_serial(monkeypatch):
+    # 0bda:0316 is a stock Realtek card reader id; never bind one by guess
+    monkeypatch.setattr(sdwire_driver.platform, "system", lambda: "Linux")
+    with pytest.raises(TypeError, match="serial"):
+        SDWire3()  # ty: ignore[missing-argument]
+
+
+def test_sdwire3_repr(monkeypatch):
+    _attach(monkeypatch, [_FakeSDWire3(port_numbers=(2,))])
+
+    assert repr(SDWire3(serial=ID)).startswith("SDWire3(")
+
+
+def test_sdwire3_found_by_sdwire_list_id(monkeypatch):
+    # units share one USB serial, so the id carries the port path too, or
+    # bus.address without one, and "unknown" stands in for a missing serial. The
+    # serial is read from sysfs: opening a reader would wake it
+    near = _FakeSDWire3(port_numbers=(1, 4, 1, 4, 3, 2))
+    far = _FakeSDWire3(port_numbers=(2, 1))
+    bare = _FakeSDWire3(port_numbers=None, serial=None)
+    nameless = _FakeSDWire3(port_numbers=(2,), bus=1, serial=None)
+    _attach(monkeypatch, [nameless, far, near, bare])
+
+    assert SDWire3(serial="20120501030900000.1.4.1.4.3.2").dev is near
+    assert SDWire3(serial="20120501030900000.2.1").dev is far
+    assert SDWire3(serial="unknown.2").dev is nameless
+    unlocated = SDWire3(serial="unknown:5.51")
+    assert unlocated.dev is bare
+    with pytest.raises(RuntimeError, match="sysfs"):
+        unlocated.dut()
+    # a moved cable changes the id; say which ids are there
+    with pytest.raises(FileNotFoundError, match=r"20120501030900000\.2 .*20120501030900000\.2\.1"):
+        SDWire3(serial=ID)
+    assert [dev.opens for dev in (near, far, bare, nameless)] == [0, 0, 0, 0]
+
+
+def test_sdwire3_same_id_on_two_buses_is_ambiguous(monkeypatch):
+    _attach(monkeypatch, [_FakeSDWire3(port_numbers=(2,), bus=1), _FakeSDWire3(port_numbers=(2,), bus=3)])
+
+    with pytest.raises(RuntimeError, match="multiple.*buses 1, 3"):
+        SDWire3(serial=ID)
+
+
+def test_sdwire3_serves_flash_while_card_on_dut(monkeypatch, tmp_path):
+    # no disk while the card is on the DUT; a switch to the side the card is on
+    # does nothing, and off() hands the card to the host. Only a switch opens the
+    # reader, and it closes it again; power settings in place are not rewritten
+    dev = _FakeSDWire3(port_numbers=(2,), bound=False)
+    _attach(monkeypatch, [dev])
+    disk, image = tmp_path / "disk", tmp_path / "image"
+    disk.write_bytes(bytes(512))
+    image.write_bytes(b"image")
+    monkeypatch.setattr(sdwire_driver, "_find_reader_disk_linux", lambda path: str(disk) if dev.bound else None)
+    writes = []
+    monkeypatch.setattr(sdwire_driver, "_sysfs_write", lambda path, value: writes.append(path))
+    sdwire = SDWire3(serial=ID, storage_leeway=0)
+
+    with serve(sdwire) as client:
+        client.flash(image)
+        client.dut()
+        client.off()
+        client.dut()
+
+    assert disk.read_bytes().startswith(b"image")
+    assert dev.calls == [("attach", 0), ("reset",), ("detach", 0), ("reset",)] * 2
+    assert sdwire.query() == "dut" and dev.status == "suspended"
+    assert dev.opens == 4 and not dev.is_open and writes == []
+
+
+def test_sdwire3_dut_waits_for_runtime_suspend(monkeypatch):
+    # the card reaches the DUT only once the reader runtime-suspends: dut()
+    # enables autosuspend before unbinding it, and waits until it has suspended
+    dev = _FakeSDWire3(port_numbers=(2,))
+    _attach(monkeypatch, [dev])
+    sdwire = SDWire3(serial=ID)
+
+    sdwire.dut()
+    assert dev.power_at_detach == ("0", "auto") and dev.status == "suspended"
+
+    # with nothing to unbind, dut() still enables autosuspend
+    dev.set_power("control", "on")
+    sdwire.dut()
+    assert dev.status == "suspended" and dev.calls == [("detach", 0), ("reset",)]
+
+
+def test_sdwire3_logs_switches(monkeypatch, caplog):
+    _attach(monkeypatch, [_FakeSDWire3(port_numbers=(2,))])
+    sdwire = SDWire3(serial=ID, log_level="DEBUG")
+
+    with caplog.at_level(logging.DEBUG):
+        sdwire.dut()
+        sdwire.dut()
+        sdwire.host()
+        sdwire.host()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert [re.sub(r"[0-9.]+ s", "N s", message) for message in messages] == [
+        f"SDWire3 {ID}: card switched to dut in N s, runtime-suspended after N s",
+        f"SDWire3 {ID}: card already on dut, runtime-suspended after N s",
+        f"SDWire3 {ID}: card switched to host in N s",
+        f"SDWire3 {ID}: card already on host",
+    ]
+
+
+def test_sdwire3_dut_fails_while_the_reader_stays_awake(monkeypatch):
+    # another process holding the reader open keeps the card from the DUT; dut()
+    # says so, also when there is nothing left to unbind
+    dev = _FakeSDWire3(port_numbers=(2,))
+    _attach(monkeypatch, [dev])
+    monkeypatch.setattr(sdwire_driver, "_SUSPEND_TIMEOUT", 0.2)
+    sdwire = SDWire3(serial=ID)
+
+    dev.hold()
+    with pytest.raises(RuntimeError, match="may not have reached the DUT"):
+        sdwire.dut()
+    with pytest.raises(RuntimeError, match="may not have reached the DUT"):
+        sdwire.dut()
+
+    # a power setting that can't be written stops dut() before it unbinds
+    sdwire.host()
+    calls = list(dev.calls)
+    (dev.dir / "power/control").unlink()
+    (dev.dir / "power/control").mkdir()
+    with pytest.raises(RuntimeError, match=r"cannot set .*power/control"):
+        sdwire.dut()
+    assert dev.calls == calls
+
+
+def test_sdwire3_power_write_errors(monkeypatch, tmp_path):
+    # only a permission error points at root and the udev rule
+    path = str(tmp_path / "control")
+    with pytest.raises(RuntimeError, match="cannot set") as missing:
+        sdwire_driver._sysfs_write(str(tmp_path / "missing" / "control"), "auto")
+    with pytest.raises(RuntimeError, match="cannot set") as directory:
+        sdwire_driver._sysfs_write(str(tmp_path), "auto")
+    for error in (missing, directory):
+        assert "udev" not in str(error.value) and "needs root" not in str(error.value)
+
+    def denied(file, mode="r"):
+        raise PermissionError(errno.EACCES, "Permission denied", file)
+
+    monkeypatch.setattr(sdwire_driver, "open", denied, raising=False)
+    with pytest.raises(RuntimeError, match=r"control to auto: .*needs root, or Badgerd's udev/90-sdwire.rules"):
+        sdwire_driver._sysfs_write(path, "auto")
+
+
+def test_sdwire3_state_is_that_of_interface_0(monkeypatch):
+    dev = _FakeSDWire3(port_numbers=(2,), bound=False)
+    other = dev.dir / f"{dev.dir.name}:1.1"
+    other.mkdir()
+    (other / "driver").symlink_to(dev.root)
+    _attach(monkeypatch, [dev])
+
+    assert SDWire3(serial=ID).query() == "dut"
+
+
+def test_sdwire3_switches_the_device_found_now(monkeypatch):
+    # a reset that re-enumerates the reader, as a replug does, fails: the device
+    # it was found as is gone, and its handle is closed all the same
+    old = _FakeSDWire3(port_numbers=(2,))
+    old.reset_fails = True
+    new = _FakeSDWire3(port_numbers=(2,), bus=6)
+    _attach(monkeypatch, [old], [old], [new], [])
+    sdwire = SDWire3(serial=ID)
+
+    with pytest.raises(usb.core.USBError):
+        sdwire.dut()
+    sdwire.dut()
+    with pytest.raises(FileNotFoundError, match="none"):
+        sdwire.dut()
+
+    assert old.calls == [("detach", 0), ("reset",)] and not old.is_open
+    assert new.calls == [("detach", 0), ("reset",)]
+
+
+def test_sdwire3_switches_to_host_the_device_found_now(monkeypatch):
+    old = _FakeSDWire3(port_numbers=(2,), bound=False)
+    old.reset_fails = True
+    new = _FakeSDWire3(port_numbers=(2,), bus=6, bound=False)
+    _attach(monkeypatch, [old], [old], [new], [])
+    sdwire = SDWire3(serial=ID)
+
+    with pytest.raises(usb.core.USBError):
+        sdwire.host()
+    sdwire.host()
+    with pytest.raises(FileNotFoundError, match="none"):
+        sdwire.host()
+
+    assert old.calls == [("attach", 0), ("reset",)] and not old.is_open
+    assert new.calls == [("attach", 0), ("reset",)]
+
+
+class _FakeUdev:
+    def __init__(self, subsystem, device_type=None, links=(), children=()):
+        self.subsystem = subsystem
+        self.device_type = device_type
+        self.device_links = list(links)
+        self.children: list[_FakeUdev] = list(children)
+        self.parent = None
+
+
+def _patch_pyudev(monkeypatch, sys_path, usb_device):
+    """pyudev finds `usb_device` only at `sys_path`."""
+    import pyudev
+
+    def from_sys_path(context, path):
+        if path != str(sys_path):
+            raise pyudev.DeviceNotFoundAtPathError(path)
+        return usb_device
+
+    monkeypatch.setattr(pyudev, "Context", lambda: None)
+    monkeypatch.setattr(pyudev.Devices, "from_sys_path", from_sys_path)
+
+
+def test_sdwire3_storage_is_its_own_disk(monkeypatch):
+    # none while the card is on the DUT, then the reader's own disk: not its
+    # partition, and not another reader's disk on the same hub; a configured
+    # storage_device takes precedence
+    sdwire3 = _FakeUdev("usb", "usb_device", children=[_FakeUdev("usb", "usb_interface")])
+    other = _FakeUdev("block", "disk", ["/dev/disk/by-diskseq/7"])
+    sdwire3.parent = _FakeUdev("usb", "usb_device", children=[sdwire3, other])
+    dev = _FakeSDWire3(port_numbers=(2,), bound=False)
+    _patch_pyudev(monkeypatch, dev.dir, sdwire3)
+    _attach(monkeypatch, [dev])
+    sdwire = SDWire3(serial=ID)
+
+    assert sdwire.effective_storage_device() is None
+
+    sdwire3.children += [
+        _FakeUdev("block", "partition", ["/dev/disk/by-diskseq/42-part1"]),
+        _FakeUdev("block", "disk", ["/dev/disk/by-id/usb-Generic-_SD_MMC", "/dev/disk/by-diskseq/42"]),
+    ]
+    assert sdwire.effective_storage_device() == "/dev/disk/by-diskseq/42"
+
+    sdwire.storage_device = "/dev/sdz"
+    assert sdwire.effective_storage_device() == "/dev/sdz"
+
+
+def test_sdwire3_storage_lookup_without_a_device(tmp_path):
+    assert sdwire_driver._find_reader_disk_linux(str(tmp_path / "gone")) is None
 
 
 def test_drivers_sdwire():

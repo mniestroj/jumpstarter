@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import glob
+import os
 import platform
 import subprocess
 import time
+from abc import abstractmethod
 from dataclasses import dataclass, field
 
 import anyio
@@ -32,6 +35,13 @@ _SMSC_HUB_PORT = 1
 # SD card reader behind the hub (shares the SMSC vendor id).
 _SMSC_READER_VID = 0x0424
 _SMSC_READER_PID = 0x4050
+
+# SDWire3: the Realtek card reader is itself the mux.
+_SDWIRE3_VID = 0x0BDA
+_SDWIRE3_PID = 0x0316
+
+_SYSFS_USB_DEVICES = "/sys/bus/usb/devices"
+_SUSPEND_TIMEOUT = 5.0
 
 
 def _hex_id(value: int) -> str:
@@ -161,16 +171,82 @@ def _find_storage_device_macos(serial: str | None) -> str | None:
 
 
 @dataclass(kw_only=True)
-class SDWire(StorageMuxFlasherInterface, Driver):
-    serial: str | None = field(default=None)
+class _SDWireBase(StorageMuxFlasherInterface, Driver):
+    """Storage mux whose card is written through a block device on the exporter."""
+
     dev: usb.core.Device = field(init=False)
-    itf: usb.core.Interface = field(init=False)
-    _serial: str | None = field(init=False, default=None)
 
     storage_device: str | None = field(default=None)
     storage_timeout: int = field(default=10)
     storage_leeway: int = field(default=6)
     storage_fsync_timeout: int = field(default=900)
+
+    @abstractmethod
+    def effective_storage_device(self) -> str | None:
+        """The card's block device on the exporter, or None while there is none."""
+
+    # @export is untyped, which lets these synchronous declarations override the
+    # interface's async ones.
+    @export
+    @abstractmethod
+    def host(self) -> None: ...
+
+    @export
+    @abstractmethod
+    def dut(self) -> None: ...
+
+    async def _await_storage_device(self, timeout: int) -> str | None:
+        deadline = time.monotonic() + timeout
+        while True:
+            device = await anyio.to_thread.run_sync(self.effective_storage_device)
+            if device is not None:
+                return device
+            if time.monotonic() >= deadline:
+                return None
+            await anyio.sleep(1)
+
+    @export
+    def off(self):
+        self.host()
+
+    @export
+    async def write(self, src: str):
+        await anyio.to_thread.run_sync(self.host)
+        storage = await self._await_storage_device(self.storage_timeout)
+        if storage is None:
+            raise RuntimeError("SD card disk did not become available on host within storage_timeout")
+        async with self.resource(src) as res:
+            await write_to_storage_device(
+                storage,
+                res,
+                timeout=self.storage_timeout,
+                leeway=self.storage_leeway,
+                fsync_timeout=self.storage_fsync_timeout,
+                logger=self.logger,
+            )
+
+    @export
+    async def read(self, dst: str):
+        await anyio.to_thread.run_sync(self.host)
+        storage = await self._await_storage_device(self.storage_timeout)
+        if storage is None:
+            raise RuntimeError("SD card disk did not become available on host within storage_timeout")
+        async with self.resource(dst) as res:
+            await read_from_storage_device(
+                storage,
+                res,
+                timeout=self.storage_timeout,
+                logger=self.logger,
+            )
+
+
+@dataclass(kw_only=True)
+class SDWire(_SDWireBase):
+    """SD Wire storage mux (FTDI FT200X controller, SMSC card reader)."""
+
+    serial: str | None = field(default=None)
+    itf: usb.core.Interface = field(init=False)
+    _serial: str | None = field(init=False, default=None)
 
     def effective_storage_device(self):
         if self.storage_device is not None:
@@ -189,16 +265,6 @@ class SDWire(StorageMuxFlasherInterface, Driver):
             if time.monotonic() >= deadline:
                 return None
             time.sleep(1)
-
-    async def _await_storage_device(self, timeout: int) -> str | None:
-        deadline = time.monotonic() + timeout
-        while True:
-            device = await anyio.to_thread.run_sync(self.effective_storage_device)
-            if device is not None:
-                return device
-            if time.monotonic() >= deadline:
-                return None
-            await anyio.sleep(1)
 
     def _find_device(self) -> tuple[usb.core.Device, str | None] | None:
         candidates: list[tuple[usb.core.Device, str | None]] = []
@@ -315,36 +381,168 @@ class SDWire(StorageMuxFlasherInterface, Driver):
             time.sleep(1)
         self.select(0xF0)
 
+
+def _find_reader_disk_linux(sys_path: str) -> str | None:
+    """The by-diskseq link of the first disk anywhere below the USB device at `sys_path`."""
+    try:
+        import pyudev
+    except ImportError:
+        return None
+    try:
+        udevice = pyudev.Devices.from_sys_path(pyudev.Context(), sys_path)
+        for block in udevice.children:
+            if block.subsystem == "block" and block.device_type == "disk":
+                for link in block.device_links:
+                    if link.startswith("/dev/disk/by-diskseq/"):
+                        return link
+    except (ImportError, OSError, AttributeError, pyudev.DeviceNotFoundError):
+        pass
+    return None
+
+
+def _sysfs_path(dev: usb.core.Device) -> str | None:
+    """The device's sysfs directory. Reading it does not open the device, which
+    would wake it from runtime suspend."""
+    ports = getattr(dev, "port_numbers", None)
+    if not ports:
+        return None
+    return os.path.join(_SYSFS_USB_DEVICES, f"{dev.bus}-{'.'.join(map(str, ports))}")
+
+
+def _sysfs_read(path: str) -> str | None:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _sysfs_write(path: str, value: str) -> None:
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+    except PermissionError as e:
+        raise RuntimeError(
+            f"cannot set {path} to {value}: {e}; the exporter needs root, or Badgerd's udev/90-sdwire.rules installed"
+        ) from e
+    except OSError as e:
+        raise RuntimeError(f"cannot set {path} to {value}: {e}") from e
+
+
+@dataclass(kw_only=True)
+class SDWire3(_SDWireBase):
+    """Badgerd SDWire3 storage mux (Realtek 0bda:0316 card reader that is itself the mux); Linux only.
+
+    The card is on the host while usb-storage is bound to interface 0, and on
+    the DUT once that driver is unbound and the reader has runtime-suspended,
+    which takes power/control=auto and no open handle on the device.
+
+    `serial` is the id `sdwire list` prints: the USB serial number, which every
+    unit shares, followed by the USB port path.
+    """
+
+    serial: str = field()
+
+    def __post_init__(self):
+        if platform.system() != "Linux":
+            raise RuntimeError("SDWire3 requires Linux (kernel usb-storage switching, udev disk lookup)")
+        super().__post_init__()
+        self._connect()
+
+    def _attached(self) -> list[tuple[usb.core.Device, str]]:
+        """Every attached SDWire3, with the id `sdwire list` prints for it."""
+        attached = []
+        for dev in usb.core.find(idVendor=_SDWIRE3_VID, idProduct=_SDWIRE3_PID, find_all=True):
+            path = _sysfs_path(dev)
+            serial = (path and _sysfs_read(os.path.join(path, "serial"))) or "unknown"
+            ports = dev.port_numbers
+            ident = f"{serial}.{'.'.join(map(str, ports))}" if ports else f"{serial}:{dev.bus}.{dev.address}"
+            attached.append((dev, ident))
+        return attached
+
+    def _find_device(self) -> usb.core.Device | None:
+        candidates = [dev for dev, ident in self._attached() if ident == self.serial]
+        if len(candidates) > 1:
+            buses = ", ".join(str(dev.bus) for dev in candidates)
+            raise RuntimeError(f"found multiple SDWire3 devices with id {self.serial} on USB buses {buses}")
+        return candidates[0] if candidates else None
+
+    def _connect(self):
+        found = self._find_device()
+        if found is None:
+            attached = ", ".join(ident for _, ident in self._attached()) or "none"
+            raise FileNotFoundError(f"failed to find SDWire3 {self.serial} (attached: {attached})")
+        self.dev = found
+
+    def _sysfs(self, *names: str) -> str:
+        path = _sysfs_path(self.dev)
+        if path is None:
+            raise RuntimeError(f"cannot locate SDWire3 {self.serial} in sysfs without a USB port path")
+        return os.path.join(path, *names)
+
+    def effective_storage_device(self):
+        if self.storage_device is not None:
+            return self.storage_device
+        return _find_reader_disk_linux(self._sysfs())
+
+    def query(self):
+        name = os.path.basename(self._sysfs())
+        interfaces = glob.glob(self._sysfs(f"{name}:*.0"))
+        return "host" if any(os.path.exists(os.path.join(i, "driver")) for i in interfaces) else "dut"
+
+    def _rebind(self, bind: bool):
+        try:
+            if bind:
+                self.dev.attach_kernel_driver(0)
+            else:
+                self.dev.detach_kernel_driver(0)
+            self.dev.reset()
+        finally:
+            # an open handle keeps the reader from runtime-suspending
+            usb.util.dispose_resources(self.dev)
+
+    def _enable_autosuspend(self):
+        for name, value in (("autosuspend_delay_ms", "0"), ("control", "auto")):
+            path = self._sysfs("power", name)
+            if _sysfs_read(path) != value:
+                _sysfs_write(path, value)
+
+    def _wait_for_suspend(self) -> float:
+        path = self._sysfs("power", "runtime_status")
+        start = time.monotonic()
+        while (status := _sysfs_read(path)) != "suspended":
+            if time.monotonic() - start >= _SUSPEND_TIMEOUT:
+                control = _sysfs_read(self._sysfs("power", "control"))
+                raise RuntimeError(
+                    f"SDWire3 {self.serial} still {status} after {_SUSPEND_TIMEOUT:g} s "
+                    f"with power/control={control}; the card may not have reached the DUT"
+                )
+            time.sleep(0.1)
+        return time.monotonic() - start
+
+    # Every switch resets the reader, which can re-enumerate it: look it up afresh.
     @export
-    def off(self):
-        self.host()
+    def host(self):
+        start = time.monotonic()
+        self._connect()
+        if self.query() == "host":
+            self.logger.debug(f"SDWire3 {self.serial}: card already on host")
+            return
+        self._rebind(bind=True)
+        self.logger.debug(f"SDWire3 {self.serial}: card switched to host in {time.monotonic() - start:.1f} s")
 
     @export
-    async def write(self, src: str):
-        await anyio.to_thread.run_sync(self.host)
-        storage = await self._await_storage_device(self.storage_timeout)
-        if storage is None:
-            raise RuntimeError("SD card disk did not become available on host within storage_timeout")
-        async with self.resource(src) as res:
-            await write_to_storage_device(
-                storage,
-                res,
-                timeout=self.storage_timeout,
-                leeway=self.storage_leeway,
-                fsync_timeout=self.storage_fsync_timeout,
-                logger=self.logger,
-            )
-
-    @export
-    async def read(self, dst: str):
-        await anyio.to_thread.run_sync(self.host)
-        storage = await self._await_storage_device(self.storage_timeout)
-        if storage is None:
-            raise RuntimeError("SD card disk did not become available on host within storage_timeout")
-        async with self.resource(dst) as res:
-            await read_from_storage_device(
-                storage,
-                res,
-                timeout=self.storage_timeout,
-                logger=self.logger,
-            )
+    def dut(self):
+        start = time.monotonic()
+        self._connect()
+        self._enable_autosuspend()
+        if self.query() == "dut":
+            suspend = self._wait_for_suspend()
+            self.logger.debug(f"SDWire3 {self.serial}: card already on dut, runtime-suspended after {suspend:.1f} s")
+            return
+        self._rebind(bind=False)
+        suspend = self._wait_for_suspend()
+        self.logger.debug(
+            f"SDWire3 {self.serial}: card switched to dut in {time.monotonic() - start:.1f} s, "
+            f"runtime-suspended after {suspend:.1f} s"
+        )

@@ -1,0 +1,4 @@
+type: "jumpstarter_driver_sdwire.driver.SDWire3"
+config:
+  # required: the id `sdwire list` prints
+  serial: "20120501030900000.1.4"
